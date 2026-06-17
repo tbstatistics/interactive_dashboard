@@ -8,13 +8,14 @@ import { Message } from './chan/message';
 import { EmPtr } from './emscripten';
 import { newRClassProxy } from './proxy';
 import { RCharacter, RComplex, RDouble } from './robj-main';
-import { REnvironment, RSymbol, RInteger } from './robj-main';
-import { RList, RLogical, RNull, RObject, RPairlist, RRaw, RString, RCall } from './robj-main';
+import { REnvironment, RSymbol, RInteger, RList, RDataFrame } from './robj-main';
+import { RLogical, RNull, RObject, RPairlist, RRaw, RString, RCall } from './robj-main';
 import * as RWorker from './robj-worker';
 import { EvalROptions, InstallPackagesOptions } from './webr-chan';
 export { Console, ConsoleCallbacks } from './console';
 export * from './robj-main';
 export * from './error';
+export * from './webr-chan';
 export { ChannelType } from './chan/channel-common';
 /**
  * The webR FS API for interacting with the Emscripten Virtual File System.
@@ -74,23 +75,49 @@ export type FSNode = {
     };
 };
 /** An Emscripten Filesystem type */
-export type FSType = 'NODEFS' | 'WORKERFS';
+export type FSType = 'NODEFS' | 'WORKERFS' | 'IDBFS' | 'DRIVEFS';
 /**
  * Configuration settings to be used when mounting Filesystem objects with
  * Emscripten
- * */
-export type FSMountOptions<T extends FSType = FSType> = T extends 'NODEFS' ? {
+ */
+export type FSMountOptions<T extends FSType = FSType> = T extends 'DRIVEFS' ? {
+    driveName?: string;
+    browsingContextId?: string;
+} : T extends 'NODEFS' ? {
     root: string;
 } : {
     blobs?: Array<{
         name: string;
-        data: Blob;
+        data: Blob | Buffer | ArrayBufferLike | Uint8Array;
     }>;
     files?: Array<File | FileList>;
     packages?: Array<{
-        metadata: any;
-        blob: Blob;
+        metadata: FSMetaData;
+        blob: Blob | Buffer | ArrayBufferLike | Uint8Array;
     }>;
+};
+/**
+ * Emscripten filesystem image metadata
+ */
+export type FSMetaData = {
+    files: {
+        filename: string;
+        start: number;
+        end: number;
+    }[];
+    gzip?: boolean;
+};
+/** Emscripten filesystem entry information, as given by `FS.analyzePath()` */
+export type FSAnalyzeInfo = {
+    isRoot: boolean;
+    exists: boolean;
+    error: Error;
+    name: string;
+    path: string;
+    object?: FSNode;
+    parentExists: boolean;
+    parentPath: string;
+    parentObject?: FSNode;
 };
 /**
  * The configuration settings to be used when starting webR.
@@ -155,6 +182,8 @@ export interface WebROptions {
 export declare class WebR {
     #private;
     globalShelter: Shelter;
+    version: string;
+    versionR: string;
     RObject: ReturnType<typeof newRClassProxy<typeof RWorker.RObject, RObject>>;
     RLogical: ReturnType<typeof newRClassProxy<typeof RWorker.RLogical, RLogical>>;
     RInteger: ReturnType<typeof newRClassProxy<typeof RWorker.RInteger, RInteger>>;
@@ -163,6 +192,7 @@ export declare class WebR {
     RComplex: ReturnType<typeof newRClassProxy<typeof RWorker.RComplex, RComplex>>;
     RRaw: ReturnType<typeof newRClassProxy<typeof RWorker.RRaw, RRaw>>;
     RList: ReturnType<typeof newRClassProxy<typeof RWorker.RList, RList>>;
+    RDataFrame: ReturnType<typeof newRClassProxy<typeof RWorker.RDataFrame, RDataFrame>>;
     RPairlist: ReturnType<typeof newRClassProxy<typeof RWorker.RPairlist, RPairlist>>;
     REnvironment: ReturnType<typeof newRClassProxy<typeof RWorker.REnvironment, REnvironment>>;
     RSymbol: ReturnType<typeof newRClassProxy<typeof RWorker.RSymbol, RSymbol>>;
@@ -180,7 +210,7 @@ export declare class WebR {
     constructor(options?: WebROptions);
     /**
      * @returns {Promise<void>} A promise that resolves once webR has been
-     * intialised.
+     * initialised.
      */
     init(): Promise<unknown>;
     /**
@@ -194,6 +224,11 @@ export declare class WebR {
      * @returns {Promise<Message>} The output message
      */
     read(): Promise<Message>;
+    /**
+     * Stream output messages from the communication channel via an async generator.
+     * @yields {Promise<Message>} Output messages from the communication channel.
+     */
+    stream(): AsyncGenerator<Message, void>;
     /**
      * Flush the output queue in the communication channel and return all output
      * messages.
@@ -213,12 +248,13 @@ export declare class WebR {
     /** Attempt to interrupt a running R computation. */
     interrupt(): void;
     /**
-     * Install a list of R packages from a Wasm binary package repo.
-     * @param {string[]} packages An array of R package names.
+     * Install a list of R packages from Wasm binary package repositories.
+     * @param {string | string[]} packages An string or array of strings
+     *   containing R package names.
      * @param {InstallPackagesOptions} [options] Options to be used when
      *   installing webR packages.
      */
-    installPackages(packages: string[], options?: InstallPackagesOptions): Promise<void>;
+    installPackages(packages: string | string[], options?: InstallPackagesOptions): Promise<void>;
     /**
      * Destroy an R object reference.
      * @param {RObject} x An R object reference.
@@ -227,16 +263,40 @@ export declare class WebR {
     /**
      * Evaluate the given R code.
      *
-     * Stream outputs and any conditions raised during exectution are written to
+     * Stream outputs and any conditions raised during execution are written to
      * the JavaScript console.
      * @param {string} code The R code to evaluate.
      * @param {EvalROptions} [options] Options for the execution environment.
      * @returns {Promise<RObject>} The result of the computation.
      */
     evalR(code: string, options?: EvalROptions): Promise<RObject>;
+    /**
+     * Evaluate the given R code, returning a promise for no return data.
+     * @param {string} code The R code to evaluate.
+     * @param {EvalROptions} [options] Options for the execution environment.
+     * @returns {Promise<void>} A promise which fires when the R code completes, but returns no data.
+     */
     evalRVoid(code: string, options?: EvalROptions): Promise<void>;
+    /**
+     * Evaluate the given R code, returning a promise for a boolean value. If the returned R value is not a boolean, an error will be thrown.
+     * @param {string} code The R code to evaluate.
+     * @param {EvalROptions} [options] Options for the execution environment.
+     * @returns {Promise<boolean>} The result of the computation.
+     */
     evalRBoolean(code: string, options?: EvalROptions): Promise<boolean>;
+    /**
+     * Evaluate the given R code, returning a promise for a number. If the returned R value is not a number, an error will be thrown.
+     * @param {string} code The R code to evaluate.
+     * @param {EvalROptions} [options] Options for the execution environment.
+     * @returns {Promise<number>} The result of the computation.
+     */
     evalRNumber(code: string, options?: EvalROptions): Promise<number>;
+    /**
+     * Evaluate the given R code, returning a promise for a string. If the returned R value is not a string, an error will be thrown.
+     * @param {string} code The R code to evaluate.
+     * @param {EvalROptions} [options] Options for the execution environment.
+     * @returns {Promise<string>} The result of the computation.
+     */
     evalRString(code: string, options?: EvalROptions): Promise<string>;
     /**
      * Evaluate the given R code, returning the result as a raw JavaScript object.
@@ -254,10 +314,13 @@ export declare class WebR {
     evalRRaw(code: string, outputType: 'string[]', options?: EvalROptions): Promise<string[]>;
     invokeWasmFunction(ptr: EmPtr, ...args: number[]): Promise<EmPtr>;
     FS: {
+        analyzePath: (path: string, dontResolveLastLink?: boolean) => Promise<FSAnalyzeInfo>;
         lookupPath: (path: string) => Promise<FSNode>;
         mkdir: (path: string) => Promise<FSNode>;
         mount: <T extends FSType>(type: T, options: FSMountOptions<T>, mountpoint: string) => Promise<void>;
+        syncfs: (populate: boolean) => Promise<void>;
         readFile: (path: string, flags?: string) => Promise<Uint8Array>;
+        rename: (oldpath: string, newpath: string) => Promise<void>;
         rmdir: (path: string) => Promise<void>;
         writeFile: (path: string, data: ArrayBufferView, flags?: string) => Promise<void>;
         unlink: (path: string) => Promise<void>;
@@ -275,6 +338,7 @@ export declare class Shelter {
     RComplex: ReturnType<typeof newRClassProxy<typeof RWorker.RComplex, RComplex>>;
     RRaw: ReturnType<typeof newRClassProxy<typeof RWorker.RRaw, RRaw>>;
     RList: ReturnType<typeof newRClassProxy<typeof RWorker.RList, RList>>;
+    RDataFrame: ReturnType<typeof newRClassProxy<typeof RWorker.RDataFrame, RDataFrame>>;
     RPairlist: ReturnType<typeof newRClassProxy<typeof RWorker.RPairlist, RPairlist>>;
     REnvironment: ReturnType<typeof newRClassProxy<typeof RWorker.REnvironment, REnvironment>>;
     RSymbol: ReturnType<typeof newRClassProxy<typeof RWorker.RSymbol, RSymbol>>;
@@ -290,7 +354,7 @@ export declare class Shelter {
     /**
      * Evaluate the given R code.
      *
-     * Stream outputs and any conditions raised during exectution are written to
+     * Stream outputs and any conditions raised during execution are written to
      * the JavaScript console. The returned R object is protected by the shelter.
      * @param {string} code The R code to evaluate.
      * @param {EvalROptions} [options] Options for the execution environment.
@@ -300,16 +364,24 @@ export declare class Shelter {
     /**
      * Evaluate the given R code, capturing output.
      *
-     * Stream outputs and conditions raised during exectution are captured and
+     * Stream outputs and conditions raised during execution are captured and
      * returned as part of the output of this function. Returned R objects are
      * protected by the shelter.
      * @param {string} code The R code to evaluate.
      * @param {EvalROptions} [options] Options for the execution environment.
-     * @returns {Promise<{result: RObject, output: unknown[]}>} An object
-     * containing the result of the computation and and array of captured output.
+     * @returns {Promise<{
+     *   result: RObject,
+     *   output: { type: string; data: any }[],
+     *   images: ImageBitmap[]
+     * }>} An object containing the result of the computation, an array of output,
+     *   and an array of captured plots.
      */
     captureR(code: string, options?: EvalROptions): Promise<{
         result: RObject;
-        output: unknown[];
+        output: {
+            type: string;
+            data: any;
+        }[];
+        images: ImageBitmap[];
     }>;
 }
